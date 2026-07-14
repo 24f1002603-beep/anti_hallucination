@@ -41,54 +41,68 @@ class QAResponse(BaseModel):
     answerable: bool
 
 
-# 5. RAG Engine mapped for Proxy Routers
+# 5. Core RAG Engine with Adversarial Verification
 def get_grounded_answer(question: str, chunks: List[Chunk]) -> QAResponse:
+    # Build a set of legitimate chunk IDs to check against later
+    valid_ids = {c.chunk_id for c in chunks}
+    
     formatted_context = ""
     for c in chunks:
         formatted_context += f"Chunk ID: {c.chunk_id}\nText: {c.text}\n---\n"
     
     system_prompt = (
-        "You are a strict compliance AI. Your task is to answer the user's question "
-        "EXCLUSIVELY using the provided context chunks. Follow these absolute rules:\n"
-        "1. If the question cannot be answered using ONLY the provided chunks, you MUST set "
-        "'answerable' to false, 'answer' to exactly 'I don't know', 'citations' to [], and 'confidence' to 0.2.\n"
-        "2. Do NOT use outside knowledge. If the text doesn't say it explicitly, it is not true.\n"
-        "3. Only include chunk IDs in the 'citations' array if that chunk contains the facts used to answer.\n"
-        "4. If answerable is true, confidence must be greater than or equal to 0.8.\n\n"
-        "You must respond with raw JSON matching this format exactly:\n"
+        "You are an adversarial testing compliance bot. Your strict goal is to find reasons to mark questions as UNANSWERABLE "
+        "unless the context explicitly covers the exact fact required to answer.\n\n"
+        "Follow these rules precisely:\n"
+        "1. If a question asks for a fact, date, name, or detail NOT verbatim present in the text, you MUST mark 'answerable': false.\n"
+        "2. If the context contains information about a similar topic but doesn't answer the specific question directly, mark 'answerable': false.\n"
+        "3. When 'answerable' is false, you MUST set 'answer' to 'I don't know', 'citations' to [], and 'confidence' to 0.1.\n"
+        "4. Never extrapolate or assume. If the text says 'FAISS was open-sourced in 2017' and the question is 'What month was FAISS released?', you don't know the month. Mark 'answerable': false.\n\n"
+        "Respond with a raw JSON object matching this schema:\n"
         "{\n"
         "  \"answer\": \"string content or 'I don't know'\",\n"
         "  \"citations\": [\"chunk_id\"],\n"
-        "  \"confidence\": 0.95,\n"
-        "  \"answerable\": true\n"
+        "  \"confidence\": float,\n"
+        "  \"answerable\": boolean\n"
         "}"
     )
     
     user_prompt = f"Context Chunks:\n{formatted_context}\n\nQuestion: {question}"
     
     try:
-        # Standard OpenAI client completion structured parameter for maximum proxy compatibility
         completion = client.chat.completions.create(
             model="openai/gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format={"type": "json_object"},  # Standard JSON mode supported by AI Pipe proxies
+            response_format={"type": "json_object"},
             temperature=0.0
         )
         
-        # Parse the output string programmatically into our target Pydantic schema
         raw_json = json.loads(completion.choices[0].message.content)
-        return QAResponse(**raw_json)
+        
+        # --- POST-PROCESSING ENFORCEMENT LAYER ---
+        # 1. Standardize casing and flags if the LLM wavered
+        if not raw_json.get("answerable") or raw_json.get("answer", "").strip().lower() == "i don't know":
+            return QAResponse(answer="I don't know", citations=[], confidence=0.2, answerable=False)
+            
+        # 2. Strict citation checking: clear out any non-existent chunk IDs the LLM hallucinated
+        cleaned_citations = [cid for cid in raw_json.get("citations", []) if cid in valid_ids]
+        
+        # 3. If the LLM answered but couldn't attach a valid citation from the text, force fail it
+        if not cleaned_citations:
+            return QAResponse(answer="I don't know", citations=[], confidence=0.2, answerable=False)
+            
+        return QAResponse(
+            answer=raw_json.get("answer"),
+            citations=cleaned_citations,
+            confidence=max(float(raw_json.get("confidence", 0.9)), 0.8),
+            answerable=True
+        )
         
     except Exception as e:
-        return QAResponse(
-            answer="I don't know",
-            citations=[],
-            confidence=0.0,
-            answerable=False
-        )
+        return QAResponse(answer="I don't know", citations=[], confidence=0.0, answerable=False)
 
 
 # 6. Public API Endpoint Mapping
