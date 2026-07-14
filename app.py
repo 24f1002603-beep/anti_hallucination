@@ -41,9 +41,9 @@ class QAResponse(BaseModel):
     answerable: bool
 
 
-# 5. Core RAG Engine with Adversarial Verification
+# 5. Core RAG Engine with Programmatic Defenses
 def get_grounded_answer(question: str, chunks: List[Chunk]) -> QAResponse:
-    # Build a set of legitimate chunk IDs to check against later
+    # Build a lookup set of valid chunk IDs provided in the request
     valid_ids = {c.chunk_id for c in chunks}
     
     formatted_context = ""
@@ -54,10 +54,10 @@ def get_grounded_answer(question: str, chunks: List[Chunk]) -> QAResponse:
         "You are an adversarial testing compliance bot. Your strict goal is to find reasons to mark questions as UNANSWERABLE "
         "unless the context explicitly covers the exact fact required to answer.\n\n"
         "Follow these rules precisely:\n"
-        "1. If a question asks for a fact, date, name, or detail NOT verbatim present in the text, you MUST mark 'answerable': false.\n"
+        "1. If a question asks for a fact, date, name, or detail NOT explicitly and verbatim present in the text, you MUST mark 'answerable': false.\n"
         "2. If the context contains information about a similar topic but doesn't answer the specific question directly, mark 'answerable': false.\n"
         "3. When 'answerable' is false, you MUST set 'answer' to 'I don't know', 'citations' to [], and 'confidence' to 0.1.\n"
-        "4. Never extrapolate or assume. If the text says 'FAISS was open-sourced in 2017' and the question is 'What month was FAISS released?', you don't know the month. Mark 'answerable': false.\n\n"
+        "4. Never extrapolate or assume. If the text says 'FAISS was open-sourced in 2017' and the question is 'What month was FAISS released?', you do not know the month. Mark 'answerable': false.\n\n"
         "Respond with a raw JSON object matching this schema:\n"
         "{\n"
         "  \"answer\": \"string content or 'I don't know'\",\n"
@@ -83,21 +83,21 @@ def get_grounded_answer(question: str, chunks: List[Chunk]) -> QAResponse:
         raw_json = json.loads(completion.choices[0].message.content)
         
         # --- POST-PROCESSING ENFORCEMENT LAYER ---
-        # 1. Standardize casing and flags if the LLM wavered
+        # Rule Check 1: If the LLM output evaluates natively to false or defaults to unanswerable text
         if not raw_json.get("answerable") or raw_json.get("answer", "").strip().lower() == "i don't know":
             return QAResponse(answer="I don't know", citations=[], confidence=0.2, answerable=False)
             
-        # 2. Strict citation checking: clear out any non-existent chunk IDs the LLM hallucinated
+        # Rule Check 2: Filter out any hallucinated chunk IDs not present in input payload
         cleaned_citations = [cid for cid in raw_json.get("citations", []) if cid in valid_ids]
         
-        # 3. If the LLM answered but couldn't attach a valid citation from the text, force fail it
+        # Rule Check 3: If the LLM attempted to write an answer but didn't pin it to a genuine chunk reference, force fail it
         if not cleaned_citations:
             return QAResponse(answer="I don't know", citations=[], confidence=0.2, answerable=False)
             
         return QAResponse(
             answer=raw_json.get("answer"),
             citations=cleaned_citations,
-            confidence=max(float(raw_json.get("confidence", 0.9)), 0.8),
+            confidence=max(float(raw_json.get("confidence", 0.95)), 0.8),
             answerable=True
         )
         
@@ -108,6 +108,7 @@ def get_grounded_answer(question: str, chunks: List[Chunk]) -> QAResponse:
 # 6. Public API Endpoint Mapping
 @app.post("/api/grounded-qa", response_model=QAResponse)
 async def grounded_qa_endpoint(request: QARequest):
+    # Short-circuit check for malformed whitespace questions or empty chunk arrays
     if not request.question.strip() or not request.chunks:
         return QAResponse(
             answer="I don't know",
@@ -118,12 +119,12 @@ async def grounded_qa_endpoint(request: QARequest):
     
     result = get_grounded_answer(request.question, request.chunks)
     
-    # Absolute strict conditional compliance overrides for adversarial queries
+    # Final protective safety wall matching the requirement specification explicitly
     if not result.answerable or result.answer.strip().lower() == "i don't know":
         return QAResponse(
             answer="I don't know",
             citations=[],
-            confidence=min(result.confidence, 0.3),  # Guarantee confidence <= 0.3
+            confidence=min(result.confidence, 0.3),  # Hard requirement constraint check: confidence <= 0.3
             answerable=False
         )
         
